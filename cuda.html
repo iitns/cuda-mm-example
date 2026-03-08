@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MM Visualizer</title>
+    <style>
+        :root {
+            --bg-color: #0d1117;
+            --panel-bg: #161b22;
+            --text-color: #c9d1d9;
+            --border-color: #30363d;
+            --accent-color: #58a6ff;
+            --matrix-a: #ff7b72;
+            --matrix-b: #79c0ff;
+            --empty-c: #ffffff; 
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        #header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background-color: var(--panel-bg);
+            border-bottom: 1px solid var(--border-color);
+            padding: 15px 30px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            z-index: 10;
+        }
+
+        .logo { font-size: 1.5rem; font-weight: bold; color: var(--text-color); }
+
+        .menu { display: flex; gap: 15px; }
+
+        .mode-btn {
+            background: transparent; color: var(--text-color);
+            border: 2px solid transparent; padding: 8px 16px;
+            cursor: pointer; border-radius: 20px; font-size: 1rem;
+            transition: all 0.2s; font-weight: bold;
+        }
+
+        .mode-btn:hover { background-color: rgba(139, 148, 158, 0.1); }
+        .mode-btn.active {
+            border-color: var(--accent-color); color: var(--accent-color);
+            background-color: rgba(88, 166, 255, 0.1);
+        }
+
+        .controls { display: flex; gap: 10px; }
+
+        .ctrl-btn {
+            padding: 8px 16px; background-color: #21262d; color: var(--text-color);
+            border: 1px solid var(--border-color); border-radius: 6px;
+            cursor: pointer; font-weight: bold; transition: background 0.2s;
+        }
+
+        .ctrl-btn:hover { background-color: #30363d; }
+        .ctrl-btn:active { background-color: #282e33; }
+
+        #main-area {
+            flex-grow: 1; display: flex; justify-content: center; align-items: center;
+            position: relative; overflow: auto; background-color: var(--bg-color);
+        }
+
+        canvas { background-color: var(--bg-color); }
+
+        #footer {
+            background-color: var(--panel-bg); border-top: 1px solid var(--border-color);
+            padding: 20px 30px; font-size: 1.1rem; line-height: 1.5; color: #8b949e;
+            display: flex; align-items: center; gap: 15px; box-shadow: 0 -4px 6px rgba(0,0,0,0.3);
+            z-index: 10; height: 100px; flex-shrink: 0; box-sizing: border-box;
+        }
+
+        .status-badge {
+            display: inline-block; padding: 6px 12px; border-radius: 15px;
+            font-size: 0.85rem; font-weight: bold; background-color: var(--border-color);
+            color: #fff; white-space: nowrap;
+        }
+        
+        #status-text { flex-grow: 1; }
+        #status-text strong { color: var(--text-color); }
+    </style>
+</head>
+<body>
+
+<div id="header">
+    <div class="logo">CUDA MM Visualizer</div>
+    
+    <div class="menu">
+        <button class="mode-btn active" id="btn-micro" onclick="setMode('micro')">Micro Mode</button>
+        <button class="mode-btn" id="btn-macro" onclick="setMode('macro')">Macro Mode</button>
+    </div>
+
+    <div class="controls">
+        <button class="ctrl-btn" onclick="play()">Play</button>
+        <button class="ctrl-btn" onclick="pause()">Pause</button>
+        <button class="ctrl-btn" onclick="reset()">Reset</button>
+    </div>
+</div>
+
+<div id="main-area">
+    <canvas id="simCanvas" width="900" height="800"></canvas>
+</div>
+
+<div id="footer">
+    <div class="status-badge" id="status-badge">IDLE</div>
+    <div id="status-text">Select Play to start visualization.</div>
+</div>
+
+<script>
+    const canvas = document.getElementById('simCanvas');
+    const ctx = canvas.getContext('2d');
+    
+    const statusBadge = document.getElementById('status-badge');
+    const statusText = document.getElementById('status-text');
+    const btnMicro = document.getElementById('btn-micro');
+    const btnMacro = document.getElementById('btn-macro');
+
+    const TILES = 4;        
+    const ELEMENTS = 4;     
+    const ELEM_PX = 8;      
+    const TILE_PX = ELEMENTS * ELEM_PX; 
+    const SCALED_TILE_PX = TILE_PX * 2.5; 
+
+    // Matrix C의 각 타일별 고유 색상 (16개) - 그라데이션 배열
+    const tileColors = [
+        '#ff5252', '#ff7b72', '#ff9800', '#ffb74d', // Row 0 (Reds/Oranges)
+        '#cddc39', '#8bc34a', '#4caf50', '#00e676', // Row 1 (Greens)
+        '#00bcd4', '#00b0ff', '#2979ff', '#5c6bc0', // Row 2 (Blues)
+        '#9c27b0', '#e040fb', '#ff4081', '#f50057'  // Row 3 (Purples/Pinks)
+    ];
+
+    // 중앙 정렬(세로축 기준 대칭)을 위한 좌표 계산 (Canvas 폭 900 기준 중심=450)
+    // Global Memory: 166(A), 386(B), 606(C) -> 총 폭 중심 450
+    // Shared Memory: 295(A), 525(B) -> 중심 450
+    // ThreadBlock: 410 -> 중심 450
+    const layout = {
+        global: { y: 20, h: 210, title: 'GLOBAL MEMORY (DRAM - Slow, Large Capacity)' },
+        globalA: { x: 166, y: 70, w: TILES*TILE_PX, h: TILES*TILE_PX, color: '#ff7b72', name: 'Matrix A' },
+        globalB: { x: 386, y: 70, w: TILES*TILE_PX, h: TILES*TILE_PX, color: '#79c0ff', name: 'Matrix B' },
+        globalC: { x: 606, y: 70, w: TILES*TILE_PX, h: TILES*TILE_PX, name: 'Matrix C' },
+        
+        shared: { y: 260, h: 230, title: 'SHARED MEMORY (L1 Cache - Fast, On-Chip)' },
+        sharedA: { x: 295, y: 310, w: SCALED_TILE_PX, h: SCALED_TILE_PX, color: '#ff7b72', name: 'Tile A' },
+        sharedB: { x: 525, y: 310, w: SCALED_TILE_PX, h: SCALED_TILE_PX, color: '#79c0ff', name: 'Tile B' },
+
+        tb: { y: 520, h: 240, title: 'THREADBLOCK / COMPUTE AREA (Registers / Tensor Cores)' },
+        tbAccum: { x: 410, y: 570, w: SCALED_TILE_PX, h: SCALED_TILE_PX, name: 'Accumulator' }
+    };
+
+    let mode = 'micro';
+    let isPlaying = false;
+    let animFrameId = null;
+    let lastTime = 0;
+
+    let sim = {
+        targetR: 0, targetC: 0, k: 0, phase: 'idle', progress: 0, completedC: []
+    };
+
+    function setMode(newMode) {
+        mode = newMode;
+        btnMicro.classList.toggle('active', mode === 'micro');
+        btnMacro.classList.toggle('active', mode === 'macro');
+        reset();
+    }
+
+    function reset() {
+        isPlaying = false;
+        cancelAnimationFrame(animFrameId);
+        
+        sim.completedC = [];
+        for (let r = 0; r < TILES; r++) {
+            let row = [];
+            for (let c = 0; c < TILES; c++) row.push(false);
+            sim.completedC.push(row);
+        }
+        
+        if (mode === 'micro') {
+            sim.targetR = 2; 
+            sim.targetC = 1;
+            for (let r = 0; r < TILES; r++) {
+                for (let c = 0; c < TILES; c++) {
+                    if (r < sim.targetR || (r === sim.targetR && c < sim.targetC)) {
+                        sim.completedC[r][c] = true;
+                    }
+                }
+            }
+        } else {
+            sim.targetR = 0;
+            sim.targetC = 0;
+        }
+
+        sim.k = 0;
+        sim.phase = 'idle';
+        sim.progress = 0;
+
+        updateStatus('IDLE', mode === 'micro' ? '준비 완료: 타겟 타일 C(2,1) 연산을 시작합니다.' : '준비 완료: Matrix C 전체 타일 연산을 시작합니다.');
+        draw();
+    }
+
+    function play() {
+        if (sim.phase === 'done') reset();
+        if (!isPlaying) {
+            isPlaying = true;
+            if (sim.phase === 'idle') sim.phase = 'global_to_shared';
+            lastTime = performance.now();
+            animLoop(lastTime);
+        }
+    }
+
+    function pause() {
+        isPlaying = false;
+        updateStatus('PAUSED', '애니메이션이 일시정지 되었습니다.');
+    }
+
+    function updateStatus(badge, text) {
+        statusBadge.innerText = badge;
+        statusBadge.style.backgroundColor = badge === 'PLAYING' ? '#58a6ff' : (badge === 'DONE' ? '#3fb950' : '#30363d');
+        statusText.innerHTML = text;
+    }
+
+    function animLoop(timestamp) {
+        if (!isPlaying) return;
+        const dt = (timestamp - lastTime) / 1000;
+        lastTime = timestamp;
+        advanceSimulation(dt);
+        draw();
+        if (isPlaying) animFrameId = requestAnimationFrame(animLoop);
+    }
+
+    function advanceSimulation(dt) {
+        const speed = (sim.phase === 'compute_mma') ? 0.8 : (mode === 'micro' ? 1.5 : 2.5); 
+        sim.progress += dt * speed;
+
+        if (sim.progress >= 1.0) {
+            sim.progress = 0;
+            
+            switch(sim.phase) {
+                case 'global_to_shared': sim.phase = 'compute_mma'; break;
+                case 'compute_mma':
+                    sim.k++;
+                    if (sim.k < TILES) sim.phase = 'global_to_shared';
+                    else sim.phase = 'tb_to_global';
+                    break;
+                case 'tb_to_global':
+                    sim.completedC[sim.targetR][sim.targetC] = true;
+                    
+                    if (mode === 'micro') {
+                        sim.phase = 'done'; isPlaying = false;
+                        updateStatus('DONE', 'Micro Mode 완료: 타겟 타일 하나에 대한 연산과 저장이 끝났습니다.');
+                    } else {
+                        sim.k = 0; sim.targetC++;
+                        if (sim.targetC >= TILES) {
+                            sim.targetC = 0; sim.targetR++;
+                        }
+                        if (sim.targetR >= TILES) {
+                            sim.phase = 'done'; isPlaying = false;
+                            updateStatus('DONE', 'Macro Mode 완료: Matrix C 전체가 채워졌습니다.');
+                        } else {
+                            sim.phase = 'global_to_shared';
+                        }
+                    }
+                    break;
+            }
+        }
+    }
+
+    function draw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        drawAreas();
+        drawMatrix(layout.globalC, true, sim.completedC);
+
+        let currentTargetColor = tileColors[sim.targetR * TILES + sim.targetC];
+
+        if (sim.phase !== 'idle' && sim.phase !== 'done') {
+            highlightRow(layout.globalA, sim.targetR);
+            highlightCol(layout.globalB, sim.targetC);
+            
+            // 타겟 타일 강조: 해당 타일이 가질 고유 색상을 테두리로 활용
+            ctx.strokeStyle = currentTargetColor;
+            ctx.lineWidth = 4;
+            ctx.strokeRect(layout.globalC.x + sim.targetC * TILE_PX, layout.globalC.y + sim.targetR * TILE_PX, TILE_PX, TILE_PX);
+        }
+
+        drawMatrix(layout.globalA, false);
+        drawMatrix(layout.globalB, false);
+
+        if (sim.phase !== 'idle' && sim.phase !== 'global_to_shared' || sim.phase === 'compute_mma' || sim.phase === 'tb_to_global') {
+            drawTile(layout.sharedA.x, layout.sharedA.y, SCALED_TILE_PX, layout.sharedA.color);
+            drawTile(layout.sharedB.x, layout.sharedB.y, SCALED_TILE_PX, layout.sharedB.color);
+        }
+
+        drawAccumulator(currentTargetColor);
+        
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 12px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(layout.tbAccum.name, layout.tbAccum.x + SCALED_TILE_PX/2, layout.tbAccum.y - 12);
+        ctx.textAlign = 'left';
+
+        if (sim.phase !== 'idle' && sim.phase !== 'done') drawAnimations(currentTargetColor);
+    }
+
+    function drawAreas() {
+        ctx.font = 'bold 14px sans-serif';
+        ctx.fillStyle = '#8b949e';
+        ctx.textAlign = 'center';
+        
+        // 박스들과 라벨들이 Canvas 중앙(450)을 기준으로 대칭 및 중앙정렬 됨
+        ctx.strokeStyle = '#30363d'; ctx.lineWidth = 2;
+        ctx.strokeRect(40, layout.global.y, canvas.width - 80, layout.global.h);
+        ctx.fillText(layout.global.title, canvas.width / 2, layout.global.y + 25);
+        
+        ctx.strokeRect(40, layout.shared.y, canvas.width - 80, layout.shared.h);
+        ctx.fillText(layout.shared.title, canvas.width / 2, layout.shared.y + 25);
+        
+        ctx.strokeRect(40, layout.tb.y, canvas.width - 80, layout.tb.h);
+        ctx.fillText(layout.tb.title, canvas.width / 2, layout.tb.y + 25);
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 13px sans-serif';
+        ctx.fillText(layout.sharedA.name, layout.sharedA.x + SCALED_TILE_PX/2, layout.sharedA.y - 12);
+        ctx.fillText(layout.sharedB.name, layout.sharedB.x + SCALED_TILE_PX/2, layout.sharedB.y - 12);
+        
+        ctx.textAlign = 'left'; // 다른 텍스트 영향을 피하기 위해 복구
+    }
+
+    function drawMatrix(box, isC, completionMatrix = null) {
+        ctx.font = 'bold 14px sans-serif';
+        ctx.fillStyle = '#ffffff';
+        ctx.textAlign = 'center';
+        ctx.fillText(box.name, box.x + (TILES*TILE_PX)/2, box.y - 12);
+        ctx.textAlign = 'left';
+
+        for (let r = 0; r < TILES; r++) {
+            for (let c = 0; c < TILES; c++) {
+                let px = box.x + c * TILE_PX;
+                let py = box.y + r * TILE_PX;
+
+                if (isC) {
+                    // 계산 완료 시 고유 색상(tileColors) 적용, 미완료 시 흰색
+                    let isCompleted = completionMatrix && completionMatrix[r][c];
+                    ctx.fillStyle = isCompleted ? tileColors[r * TILES + c] : 'var(--empty-c)';
+                } else {
+                    ctx.fillStyle = box.color;
+                    ctx.globalAlpha = 0.5; 
+                }
+                ctx.fillRect(px, py, TILE_PX, TILE_PX);
+                ctx.globalAlpha = 1.0;
+            }
+        }
+
+        ctx.strokeStyle = isC ? 'rgba(0, 0, 0, 0.15)' : 'rgba(255, 255, 255, 0.08)';
+        ctx.lineWidth = 1;
+        for (let i = 0; i <= TILES * ELEMENTS; i++) {
+            ctx.beginPath(); ctx.moveTo(box.x + i * ELEM_PX, box.y); ctx.lineTo(box.x + i * ELEM_PX, box.y + box.h); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(box.x, box.y + i * ELEM_PX); ctx.lineTo(box.x + box.w, box.y + i * ELEM_PX); ctx.stroke();
+        }
+
+        ctx.strokeStyle = isC ? '#555' : '#fff';
+        ctx.lineWidth = 1.5;
+        for (let i = 0; i <= TILES; i++) {
+            ctx.beginPath(); ctx.moveTo(box.x + i * TILE_PX, box.y); ctx.lineTo(box.x + i * TILE_PX, box.y + box.h); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(box.x, box.y + i * TILE_PX); ctx.lineTo(box.x + box.w, box.y + i * TILE_PX); ctx.stroke();
+        }
+    }
+
+    function drawTileGridOnly(x, y, size) {
+        let elSize = size / ELEMENTS;
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)'; ctx.lineWidth = 1;
+        for (let i = 1; i < ELEMENTS; i++) {
+            ctx.beginPath(); ctx.moveTo(x + i*elSize, y); ctx.lineTo(x + i*elSize, y + size); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(x, y + i*elSize); ctx.lineTo(x + size, y + i*elSize); ctx.stroke();
+        }
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+        ctx.strokeRect(x, y, size, size);
+    }
+
+    function drawTile(x, y, size, color) {
+        ctx.fillStyle = color; ctx.fillRect(x, y, size, size); drawTileGridOnly(x, y, size);
+    }
+
+    function highlightRow(box, r) {
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.2)'; ctx.fillRect(box.x, box.y + r * TILE_PX, box.w, TILE_PX);
+    }
+
+    function highlightCol(box, c) {
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.2)'; ctx.fillRect(box.x + c * TILE_PX, box.y, TILE_PX, box.h);
+    }
+
+    function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+
+    function drawAccumulator(targetColor) {
+        let elSize = SCALED_TILE_PX / ELEMENTS;
+        let totalSteps = ELEMENTS * ELEMENTS;
+        let innerStep = Math.floor(sim.progress * totalSteps);
+        
+        for (let r = 0; r < ELEMENTS; r++) {
+            for (let c = 0; c < ELEMENTS; c++) {
+                let cellIndex = r * ELEMENTS + c;
+                let cellOpacity = sim.k / TILES; 
+
+                if (sim.phase === 'compute_mma') {
+                    if (cellIndex < innerStep) cellOpacity = (sim.k + 1) / TILES; 
+                    else if (cellIndex === innerStep) cellOpacity = (sim.k + 0.5) / TILES + 0.5; 
+                } else if (sim.phase === 'tb_to_global') {
+                    cellOpacity = (sim.k) / TILES; 
+                }
+
+                if (cellOpacity > 0 && sim.phase !== 'idle') {
+                    // Accumulator가 연산되면서 목표 타일의 고유 색상으로 물들어감
+                    ctx.fillStyle = targetColor;
+                    ctx.globalAlpha = Math.min(cellOpacity, 1.0);
+                    ctx.fillRect(layout.tbAccum.x + c * elSize, layout.tbAccum.y + r * elSize, elSize, elSize);
+                    ctx.globalAlpha = 1.0;
+                }
+            }
+        }
+        drawTileGridOnly(layout.tbAccum.x, layout.tbAccum.y, SCALED_TILE_PX);
+    }
+
+    function drawAnimations(targetColor) {
+        const ax = layout.globalA.x + sim.k * TILE_PX; const ay = layout.globalA.y + sim.targetR * TILE_PX;
+        const bx = layout.globalB.x + sim.targetC * TILE_PX; const by = layout.globalB.y + sim.k * TILE_PX;
+        const cx = layout.globalC.x + sim.targetC * TILE_PX; const cy = layout.globalC.y + sim.targetR * TILE_PX;
+
+        const ease = easeOutCubic(sim.progress);
+
+        if (sim.phase === 'global_to_shared') {
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+            ctx.fillRect(ax, ay, TILE_PX, TILE_PX); ctx.fillRect(bx, by, TILE_PX, TILE_PX);
+
+            drawFloatingTile(ax, ay, layout.sharedA.x, layout.sharedA.y, layout.globalA.color, ease);
+            drawFloatingTile(bx, by, layout.sharedB.x, layout.sharedB.y, layout.globalB.color, ease);
+            
+            updateStatus('PLAYING', `<strong>Phase 1:</strong> Global Memory에서 Shared Memory로 Tile A(${sim.targetR},${sim.k})와 Tile B(${sim.k},${sim.targetC})를 복사합니다.`);
+
+        } else if (sim.phase === 'compute_mma') {
+            let totalSteps = ELEMENTS * ELEMENTS;
+            let innerStep = Math.floor(sim.progress * totalSteps);
+            if (innerStep >= totalSteps) innerStep = totalSteps - 1;
+            
+            let rA = Math.floor(innerStep / ELEMENTS); let cB = innerStep % ELEMENTS;             
+            let elemSize = SCALED_TILE_PX / ELEMENTS;
+
+            let rowY = layout.sharedA.y + rA * elemSize;
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+            ctx.fillRect(layout.sharedA.x, rowY, SCALED_TILE_PX, elemSize);
+            
+            let colX = layout.sharedB.x + cB * elemSize;
+            ctx.fillRect(colX, layout.sharedB.y, elemSize, SCALED_TILE_PX);
+
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)'; ctx.lineWidth = 1.5; ctx.setLineDash([4, 4]);
+            
+            ctx.beginPath();
+            ctx.moveTo(layout.sharedA.x + SCALED_TILE_PX, rowY + elemSize/2);
+            ctx.lineTo(layout.tbAccum.x + cB * elemSize + elemSize/2, layout.tbAccum.y + rA * elemSize + elemSize/2);
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.moveTo(colX + elemSize/2, layout.sharedB.y + SCALED_TILE_PX);
+            ctx.lineTo(layout.tbAccum.x + cB * elemSize + elemSize/2, layout.tbAccum.y + rA * elemSize + elemSize/2);
+            ctx.stroke();
+            ctx.setLineDash([]); 
+
+            updateStatus('PLAYING', `<strong>Phase 2:</strong> Shared Memory에서 읽어온 행렬을 곱하여 Accumulator에 누적(MMA)합니다. 타일 내 원소 연산 진행 중... (K 루프: ${sim.k+1}/${TILES})`);
+
+        } else if (sim.phase === 'tb_to_global') {
+            // 저장 시 고유 타겟 색상으로 날아감
+            drawFloatingTile(layout.tbAccum.x, layout.tbAccum.y, cx, cy, targetColor, ease, true);
+            updateStatus('PLAYING', `<strong>Phase 3:</strong> K 루프가 종료되었습니다. 완성된 Accumulator 타일을 Global Memory Matrix C에 저장합니다.`);
+        }
+    }
+
+    function drawFloatingTile(x1, y1, x2, y2, color, progress, shrink = false) {
+        const currX = x1 + (x2 - x1) * progress; const currY = y1 + (y2 - y1) * progress;
+        let startW = shrink ? SCALED_TILE_PX : TILE_PX; let endW = shrink ? TILE_PX : SCALED_TILE_PX;
+        const currW = startW + (endW - startW) * progress;
+        
+        ctx.globalAlpha = 0.8; drawTile(currX, currY, currW, color); ctx.globalAlpha = 1.0;
+    }
+
+    reset();
+
+</script>
+</body>
+</html>
