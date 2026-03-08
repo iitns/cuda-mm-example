@@ -117,13 +117,11 @@ __global__ void matrixMulTiled(const int* A, const int* B, int* C)
     int numtiles = N / TILE_SIZE;         // number of tiles along inner dimension
 
     for (int t = 0; t < numtiles; t++) {
-        sA[threadIdx.y][threadIdx.x] =
-            A[row * N + (t * TILE_SIZE + threadIdx.x)];   // load A tile: row 'row', columns t*TILE_SIZE..t*TILE_SIZE+TILE_SIZE-1
-
-        sB[threadIdx.y][threadIdx.x] =
-            B[(t * TILE_SIZE + threadIdx.y) * N + col];   // load B tile: rows t*TILE_SIZE.., column 'col'
+        sA[threadIdx.y][threadIdx.x] = A[row * N + (t * TILE_SIZE + threadIdx.x)];
+        sB[threadIdx.y][threadIdx.x] = B[(t * TILE_SIZE + threadIdx.y) * N + col];
 
         __syncthreads();
+
         for (int k = 0; k < TILE_SIZE; k++) {
             sum += sA[threadIdx.y][k] * sB[k][threadIdx.x];  // dot product within tile
         }
